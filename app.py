@@ -77,8 +77,18 @@ PLACEHOLDER = "data:image/svg+xml;base64," + base64.b64encode(_svg.encode()).dec
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_cover(title):
-    try:
+def _fetch_cover_cached(title):
+    # ถ้าหาไม่เจอจะ raise เพื่อไม่ให้ Streamlit จำผลลัพธ์ว่าง
+    try:  # 1) AniList
+        q = "query($s:String){Media(search:$s,type:MANGA,sort:SEARCH_MATCH){coverImage{large}}}"
+        r = requests.post("https://graphql.anilist.co", timeout=10,
+                          json={"query": q, "variables": {"s": title}})
+        url = r.json()["data"]["Media"]["coverImage"]["large"]
+        if url:
+            return url
+    except Exception:
+        pass
+    try:  # 2) Jikan (MyAnimeList)
         r = requests.get("https://api.jikan.moe/v4/manga", timeout=10,
                          params={"q": title, "limit": 1, "order_by": "members", "sort": "desc"})
         data = r.json().get("data", [])
@@ -86,7 +96,14 @@ def fetch_cover(title):
             return data[0]["images"]["jpg"]["image_url"]
     except Exception:
         pass
-    return ""
+    raise ValueError("cover not found")
+
+
+def fetch_cover(title):
+    try:
+        return _fetch_cover_cached(title)
+    except Exception:
+        return ""
 
 # =========================================================
 # USER / MANGA / LIKES
@@ -132,7 +149,7 @@ def delete_manga(manga_id):
 
 
 def refresh_covers(only_missing=False):
-    fetch_cover.clear()
+    _fetch_cover_cached.clear()
     n = 0
     for m in get_mangas():
         if only_missing and m.get("image_url"):
@@ -329,7 +346,11 @@ def create_demo_data():
 # UI HELPERS
 # =========================================================
 def display_manga_card(manga_id, title, image_url=None, score=None, rank=None, reason=None):
-    img = image_url or fetch_cover(title) or PLACEHOLDER
+    # ลิงก์ wikimedia เก่าในฐานข้อมูลใช้ไม่ได้ ให้ข้ามไปดึงรูปใหม่ตามชื่อเรื่องอัตโนมัติ
+    if image_url and "wikimedia" not in image_url:
+        img = image_url
+    else:
+        img = fetch_cover(str(title or "")) or PLACEHOLDER
     badge = ""
     if rank is not None:
         badge = f'<span class="score">#{rank} · score {score}</span>'
@@ -413,13 +434,18 @@ if page == "Dashboard":
             st.info("User นี้ยังไม่มี LIKES")
     with right:
         st.markdown("### ✨ Manga ที่ระบบแนะนำ")
-        rows = get_recommends(user_id)
+        # คำนวณสดทุกครั้ง จึงมีเหตุผลให้ทุก User (รวม User ใหม่ที่ยังไม่มี LIKES)
+        rows, _mode = get_recommendations(user_id, 5)
+        custom = get_custom_reasons(user_id)
         for i, row in enumerate(rows, start=1):
-            reason = row.get("custom_reason") or row.get("auto_reason") or "—"
+            reason = custom.get(row["manga_id"]) or make_reason(row)
             display_manga_card(row["manga_id"], row["title"], row.get("image_url"),
                                score=row.get("score"), rank=i, reason=reason)
         if not rows:
-            st.info("ยังไม่มี RECOMMENDS (ไปที่หน้า Recommendations แล้วกดสร้างเส้น RECOMMENDS)")
+            st.info("ยังไม่มี Manga สำหรับแนะนำ")
+    if st.button("🔗 สร้างเส้น RECOMMENDS ให้ทุก User", use_container_width=True):
+        st.success(f"สร้าง RECOMMENDS สำเร็จ {create_recommend_relationships(None, 5)} เส้น")
+        st.rerun()
 
 # =========================================================
 # RECOMMENDATIONS
