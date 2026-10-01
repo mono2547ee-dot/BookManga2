@@ -1,5 +1,6 @@
 import base64
 import hmac
+import os
 import html
 import time
 
@@ -345,11 +346,32 @@ def create_demo_data():
 # =========================================================
 # UI HELPERS
 # =========================================================
+def image_to_data_uri(uploaded_file):
+    """แปลงไฟล์ที่อัปโหลดเป็น data URI เพื่อเก็บใน Neo4j"""
+    mime = uploaded_file.type or "image/png"
+    return f"data:{mime};base64," + base64.b64encode(uploaded_file.getvalue()).decode()
+
+
+@st.cache_data(show_spinner=False)
+def local_cover(manga_id):
+    """รูปที่วางไว้ในโฟลเดอร์ covers/ ข้างไฟล์ app.py ตั้งชื่อตาม Manga ID เช่น covers/M004.png"""
+    base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "covers")
+    for ext, mime in (("png", "image/png"), ("jpg", "image/jpeg"),
+                      ("jpeg", "image/jpeg"), ("webp", "image/webp")):
+        path = os.path.join(base, f"{manga_id}.{ext}")
+        if os.path.isfile(path):
+            with open(path, "rb") as f:
+                return f"data:{mime};base64," + base64.b64encode(f.read()).decode()
+    return ""
+
+
 def display_manga_card(manga_id, title, image_url=None, score=None, rank=None, reason=None):
-    # ลิงก์ wikimedia เก่าในฐานข้อมูลใช้ไม่ได้ ให้ข้ามไปดึงรูปใหม่ตามชื่อเรื่องอัตโนมัติ
-    if image_url and "wikimedia" not in image_url:
+    # ลำดับ: รูปในโฟลเดอร์ covers/ > รูปที่บันทึกในฐานข้อมูล > ดึงอัตโนมัติตามชื่อเรื่อง
+    # (ลิงก์ wikimedia เก่าใช้ไม่ได้ จึงข้ามไป)
+    img = local_cover(str(manga_id))
+    if not img and image_url and "wikimedia" not in image_url:
         img = image_url
-    else:
+    if not img:
         img = fetch_cover(str(title or "")) or PLACEHOLDER
     badge = ""
     if rank is not None:
@@ -622,6 +644,14 @@ elif page == "Admin Panel":
             c3.write(""); c3.write("")
             if c3.button("🗑️ ลบ Manga", key="del_manga"):
                 delete_manga(sel_mid); st.rerun()
+            st.markdown("##### 🖼️ อัปโหลดรูปปกเอง (ใช้แทนรูปที่ระบบดึงมาผิด)")
+            up = st.file_uploader("เลือกไฟล์รูป (jpg / png / webp)", type=["jpg", "jpeg", "png", "webp"],
+                                  key=f"up_{sel_mid}")
+            if up is not None:
+                st.image(up, width=140)
+                if st.button("💾 ใช้รูปนี้เป็นปก", type="primary", key=f"save_up_{sel_mid}"):
+                    update_manga(sel_mid, new_image_url=image_to_data_uri(up))
+                    st.success("บันทึกรูปปกแล้ว"); st.rerun()
 
     # ---------- LIKES ----------
     with tabs[2]:
