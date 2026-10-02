@@ -28,6 +28,8 @@ st.markdown("""
 .score {display: inline-block; padding: .25rem .6rem; border-radius: 999px;
         background: #7c3aed; color: white; font-size: .8rem; font-weight: bold;}
 .muted {opacity: .7; font-size: .9rem;}
+.pop {display: inline-block; margin-left: .4rem; padding: .25rem .6rem; border-radius: 999px;
+       background: rgba(245,158,11,.18); color: #b45309; font-weight: 600; font-size: .85rem;}
 .reason {margin-top: .6rem; padding: .6rem .8rem; border-radius: 10px;
          background: rgba(124,58,237,.12); border-left: 4px solid #7c3aed; font-size: .92rem;}
 </style>
@@ -301,14 +303,84 @@ def search_manga(keyword=""):
         """, {"k": keyword.strip()})
 
 
-def get_graph(user_id=None):
-    where = "{user_id: $i}" if user_id else ""
-    tail = "" if user_id else "LIMIT 100"
-    return run_query(f"""
-        MATCH (u:User {where})-[r:LIKES|RECOMMENDS]->(m:Manga)
-        RETURN u.user_id AS source_id, u.name AS source_name, type(r) AS relationship,
-               m.manga_id AS target_id, m.title AS target_name {tail}
-        """, {"i": user_id})
+# =========================================================
+# POPULARITY (คะแนนความนิยม)
+# =========================================================
+_POP_CACHE = {}  # ล้างทุกครั้งที่สคริปต์รันใหม่ จึงไม่ค้างค่าเก่า
+
+
+def get_popularity():
+    """ความนิยมของ Manga ทุกเรื่อง: likes และคะแนน 0-100 = % ของ User ที่กด LIKES
+    (นับเรื่องที่ไม่มีใครกด LIKES ด้วย เพื่อให้เห็นเรื่องที่คนเลือกน้อยที่สุด)"""
+    total = run_query("MATCH (u:User) RETURN count(u) AS n")[0]["n"]
+    rows = run_query("""
+        MATCH (m:Manga)
+        OPTIONAL MATCH (u:User)-[:LIKES]->(m)
+        RETURN m.manga_id AS manga_id, m.title AS title, m.image_url AS image_url, count(u) AS likes
+        ORDER BY likes DESC, title
+        """)
+    for r in rows:
+        r["total_users"] = total
+        r["popularity"] = round(r["likes"] * 100 / total) if total else 0
+    return rows
+
+
+def get_popularity_map():
+    if "map" not in _POP_CACHE:
+        _POP_CACHE["map"] = {r["manga_id"]: r for r in get_popularity()}
+    return _POP_CACHE["map"]
+
+
+def add_friend(a, b):
+    """เชื่อม User สองคนเป็นเพื่อนกัน (เก็บเส้นเดียว ใช้เป็นแบบไม่มีทิศทาง)"""
+    run_query("""
+        MATCH (a:User {user_id: $a}), (b:User {user_id: $b})
+        WHERE a <> b AND NOT (b)-[:FRIEND_OF]->(a)
+        MERGE (a)-[:FRIEND_OF]->(b)
+        """, {"a": a, "b": b}, write=True)
+
+
+def delete_friend(a, b):
+    run_query("MATCH (a:User {user_id: $a})-[r:FRIEND_OF]-(b:User {user_id: $b}) DELETE r",
+              {"a": a, "b": b}, write=True)
+
+
+def get_friends(user_id):
+    return run_query("MATCH (:User {user_id: $i})-[:FRIEND_OF]-(f:User) "
+                     "RETURN DISTINCT f.user_id AS user_id, f.name AS name ORDER BY name", {"i": user_id})
+
+
+def get_all_friendships():
+    return run_query("MATCH (a:User)-[:FRIEND_OF]->(b:User) "
+                     "RETURN a.user_id AS a_id, a.name AS a_name, b.user_id AS b_id, b.name AS b_name "
+                     "ORDER BY a_name, b_name")
+
+
+def get_graph(user_id=None, manga_id=None, rel_types=("LIKES", "RECOMMENDS")):
+    u_f = "{user_id: $i}" if user_id else ""
+    m_f = "{manga_id: $m}" if manga_id else ""
+    tail = "" if (user_id or manga_id) else "LIMIT 100"
+    rels = [t for t in rel_types if t in ("LIKES", "RECOMMENDS")]
+    if manga_id and "LIKES" not in rels:
+        rels.insert(0, "LIKES")          # โหมดดูตาม Manga ต้องรู้ว่าใครชอบ จึงดึง LIKES เสมอ
+    rows = []
+    if rels:
+        rows = run_query(f"""
+            MATCH (u:User {u_f})-[r:{"|".join(rels)}]->(m:Manga {m_f})
+            RETURN u.user_id AS source_id, u.name AS source_name, type(r) AS relationship,
+                   m.manga_id AS target_id, m.title AS target_name, r.score AS score,
+                   "Manga" AS target_kind {tail}
+            """, {"i": user_id, "m": manga_id})
+    if "FRIEND_OF" in rel_types:
+        ids = sorted({r["source_id"] for r in rows if r["relationship"] == "LIKES"}) if manga_id else None
+        rows += run_query("""
+            MATCH (a:User)-[r:FRIEND_OF]->(b:User)
+            WHERE ($ids IS NULL OR (a.user_id IN $ids AND b.user_id IN $ids))
+              AND ($uid IS NULL OR a.user_id = $uid OR b.user_id = $uid)
+            RETURN a.user_id AS source_id, a.name AS source_name, "FRIEND_OF" AS relationship,
+                   b.user_id AS target_id, b.name AS target_name, null AS score, "User" AS target_kind
+            """, {"ids": ids, "uid": user_id})
+    return rows
 
 
 def get_metrics():
@@ -384,6 +456,10 @@ def display_manga_card(manga_id, title, image_url=None, score=None, rank=None, r
         badge = f'<span class="score">#{rank} · score {score}</span>'
     elif score is not None:
         badge = f'<span class="score">score {score}</span>'
+    p = get_popularity_map().get(manga_id)
+    if p:
+        badge += (f'<span class="pop">🔥 ความนิยม {p["popularity"]}/100 '
+                  f'· {p["likes"]}/{p["total_users"]} คนชอบ</span>')
     reason_html = (f'<div class="reason">💡 <b>เหตุผลที่แนะนำ:</b> {html.escape(str(reason))}</div>'
                    if reason else "")
     # สำคัญ: HTML ต้องไม่มีบรรทัดที่ย่อหน้า ไม่งั้น Markdown จะมองเป็น code block
@@ -427,6 +503,100 @@ def admin_gate():
             st.error("รหัสผ่านไม่ถูกต้อง")
     return False
 
+def render_relationship_graph(kp="gx"):
+    """กราฟความสัมพันธ์ User–Manga (ใช้ทั้งใน Dashboard และ Graph Explorer)"""
+    all_mangas = get_mangas()
+
+    # ---------- ตัวเลือก ----------
+    mode = st.radio("มุมมอง", ["🌐 ภาพรวมทั้งหมด", "👤 ดูตาม User", "📚 ดูตาม Manga (ใครชอบเรื่องนี้บ้าง)"],
+                    horizontal=True, key=f"{kp}_mode")
+    o1, o2, o3 = st.columns([2, 2, 1])
+    user_id = manga_id = None
+    if mode.startswith("👤"):
+        with o1:
+            user_id = user_picker(key=f"{kp}_user")
+    elif mode.startswith("📚"):
+        if not all_mangas:
+            st.warning("ยังไม่มี Manga"); return
+        mopts = {f"{m['title']} ({m['manga_id']})": m["manga_id"] for m in all_mangas}
+        with o1:
+            manga_id = mopts[st.selectbox("เลือก Manga", list(mopts.keys()), key=f"{kp}_manga")]
+    with o2:
+        rel_types = st.multiselect("ชนิดเส้นเชื่อม", ["LIKES", "RECOMMENDS", "FRIEND_OF"], default=["LIKES"],
+                                   key=f"{kp}_rel",
+                                   help="LIKES = User ชอบ Manga · RECOMMENDS = ระบบแนะนำ Manga ให้ User · FRIEND_OF = User เป็นเพื่อนกัน")
+    with o3:
+        direction = st.radio("ทิศทางกราฟ", ["LR", "TB"], horizontal=True, key=f"{kp}_dir",
+                             format_func=lambda x: "ซ้าย→ขวา" if x == "LR" else "บน→ล่าง")
+    size_by_pop = st.checkbox("ขนาดกล่อง Manga ตามความนิยม", value=True, key=f"{kp}_size")
+
+    rows = get_graph(user_id, manga_id, tuple(rel_types or ["LIKES"]))
+    if not rows:
+        st.info("ยังไม่มีข้อมูลตามตัวเลือกนี้" if rel_types else "เลือกชนิดเส้นเชื่อมอย่างน้อย 1 อย่าง")
+    else:
+        pop = get_popularity_map()
+        n_users = len({r["source_id"] for r in rows} | {r["target_id"] for r in rows if r.get("target_kind") == "User"})
+        n_mangas = len({r["target_id"] for r in rows if r.get("target_kind") != "User"})
+        if manga_id:
+            likers = sorted({r["source_name"] for r in rows if r["relationship"] == "LIKES"})
+            title = rows[0]["target_name"]
+            p = pop.get(manga_id, {})
+            st.success(f"📚 **{title}** มีคนชอบ **{len(likers)}** คน"
+                       + (f" · คะแนนความนิยม {p.get('popularity', 0)}/100" if p else "")
+                       + (": " + ", ".join(likers) if likers else ""))
+        m1, m2, m3 = st.columns(3)
+        m1.metric("👤 Users ในกราฟ", n_users); m2.metric("📚 Manga ในกราฟ", n_mangas)
+        m3.metric("🔗 เส้นเชื่อม", len(rows))
+
+        FONT = "Noto Sans Thai, Tahoma, Arial, sans-serif"
+        dot = ["digraph G {", f'rankdir="{direction}"; bgcolor="transparent"; pad="0.3"; nodesep="0.45"; ranksep="1.1";',
+               f'node [fontname="{FONT}", fontsize=13, margin="0.18,0.1"];',
+               f'edge [fontname="{FONT}", fontsize=11, arrowsize=0.8];']
+        seen = set()
+        for r in rows:
+            if r["source_id"] not in seen:
+                label = html.escape(str(r["source_name"])).replace('"', "'")
+                dot.append(f'"{r["source_id"]}" [label="👤 {label}", shape=ellipse, style="filled", '
+                           f'fillcolor="#3b82f6", color="#1d4ed8", fontcolor="white"];')
+                seen.add(r["source_id"])
+            if r["target_id"] not in seen:
+                label = str(r["target_name"]).replace('"', "'")
+                if r.get("target_kind") == "User":
+                    dot.append(f'"{r["target_id"]}" [label="👤 {label}", shape=ellipse, style="filled", '
+                               f'fillcolor="#3b82f6", color="#1d4ed8", fontcolor="white"];')
+                else:
+                    info = pop.get(r["target_id"], {})
+                    likes = info.get("likes", 0)
+                    size = f', fontsize={13 + min(likes, 8)}, penwidth={1 + min(likes, 6) * 0.6:.1f}' if size_by_pop else ""
+                    hot = r["target_id"] == manga_id
+                    fill, line = ("#f97316", "#c2410c") if hot else ("#fbbf24", "#b45309")
+                    dot.append(f'"{r["target_id"]}" [label="📚 {label}\\n❤ {likes} คน", shape=box, '
+                               f'style="rounded,filled", fillcolor="{fill}", color="{line}", fontcolor="#1f2937"{size}];')
+                seen.add(r["target_id"])
+            if r["relationship"] == "LIKES":
+                dot.append(f'"{r["source_id"]}" -> "{r["target_id"]}" [color="#ef4444", penwidth=1.6, tooltip="LIKES"];')
+            elif r["relationship"] == "FRIEND_OF":
+                dot.append(f'"{r["source_id"]}" -> "{r["target_id"]}" [color="#10b981", penwidth=2.4, dir=both, '
+                           f'arrowhead=none, arrowtail=none, label="เพื่อน", fontcolor="#059669"];')
+            else:
+                sc = r.get("score")
+                lab = f', label="แนะนำ {sc}"' if sc is not None else ', label="แนะนำ"'
+                dot.append(f'"{r["source_id"]}" -> "{r["target_id"]}" [color="#8b5cf6", style="dashed", '
+                           f'penwidth=1.6, fontcolor="#8b5cf6"{lab}];')
+        dot.append("}")
+        st.graphviz_chart("\n".join(dot), use_container_width=True)
+        st.markdown(
+            '<span class="pop" style="background:rgba(59,130,246,.18);color:#1d4ed8">● User</span>'
+            '<span class="pop">▬ Manga (ยิ่งใหญ่ = คนชอบมาก)</span>'
+            '<span class="pop" style="background:rgba(239,68,68,.15);color:#b91c1c">━ LIKES</span>'
+            '<span class="pop" style="background:rgba(139,92,246,.18);color:#6d28d9">┅ RECOMMENDS</span>'
+            '<span class="pop" style="background:rgba(16,185,129,.18);color:#047857">━ FRIEND_OF (เพื่อน)</span>',
+            unsafe_allow_html=True)
+        with st.expander("📋 ดูข้อมูลแบบตาราง"):
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.code("MATCH p=(u:User)-[r:LIKES|RECOMMENDS]->(m:Manga)\nRETURN p\nLIMIT 100", language="cypher")
+
+
 # =========================================================
 # SIDEBAR + HEADER
 # =========================================================
@@ -434,7 +604,7 @@ with st.sidebar:
     st.markdown("## 📚 MangaGraph")
     st.caption("Neo4j Aura + Streamlit")
     page = st.radio("เมนู", ["Dashboard", "Recommendations", "Manga Search",
-                             "Manage Likes", "Graph Explorer", "Admin Panel"])
+                             "Popularity", "Friends", "Manage Likes", "Graph Explorer", "Admin Panel"])
     st.divider()
     st.caption("Manga Recommendation System")
 
@@ -471,6 +641,16 @@ if page == "Dashboard":
                                score=row.get("score"), rank=i, reason=reason)
         if not rows:
             st.info("ยังไม่มี Manga สำหรับแนะนำ")
+    st.divider()
+    st.markdown("### 🕸️ กราฟความสัมพันธ์ User – Manga")
+    render_relationship_graph("gx_dash")
+    st.divider()
+    st.markdown("### 📈 ความนิยมของ Manga (จำนวนคนที่กด LIKES)")
+    _pop = pd.DataFrame(get_popularity())
+    if not _pop.empty:
+        st.bar_chart(_pop.sort_values(["likes", "title"]).set_index("title")["likes"],
+                     horizontal=True, color="#f59e0b", use_container_width=True)
+        st.caption("ดูรายละเอียดและเรื่องที่คนเลือกน้อยที่สุดได้ที่เมนู Popularity")
     if st.button("🔗 สร้างเส้น RECOMMENDS ให้ทุก User", use_container_width=True):
         st.success(f"สร้าง RECOMMENDS สำเร็จ {create_recommend_relationships(None, 5)} เส้น")
         st.rerun()
@@ -516,6 +696,100 @@ elif page == "Manga Search":
         st.info("ไม่พบ Manga")
 
 # =========================================================
+# POPULARITY
+# =========================================================
+elif page == "Popularity":
+    st.subheader("📈 ความนิยมของ Manga")
+    st.caption("คะแนนความนิยม (0–100) = สัดส่วน User ที่กด LIKES เรื่องนั้น "
+               "เช่น 7 จาก 10 คน = 70 คะแนน")
+    pop = get_popularity()
+    if not pop:
+        st.info("ยังไม่มี Manga"); st.stop()
+    df = pd.DataFrame(pop).rename(columns={"title": "Manga", "likes": "จำนวนคนที่ชอบ",
+                                           "popularity": "คะแนนความนิยม"})
+    most, least = df.iloc[0], df.iloc[-1]
+    min_likes = int(df["จำนวนคนที่ชอบ"].min())
+    least_all = df[df["จำนวนคนที่ชอบ"] == min_likes]
+    c1, c2 = st.columns(2)
+    c1.metric("🏆 นิยมที่สุด", most["Manga"], f"{int(most['จำนวนคนที่ชอบ'])} คน · {int(most['คะแนนความนิยม'])}/100")
+    c2.metric("🧊 คนเลือกน้อยที่สุด", ", ".join(least_all["Manga"].head(3)) + (" ..." if len(least_all) > 3 else ""),
+              f"{min_likes} คน", delta_color="off")
+    st.divider()
+    st.markdown("### 📉 กราฟ: ใครถูกเลือกมากน้อยแค่ไหน (เรียงจากน้อยไปมาก)")
+    asc = df.sort_values(["จำนวนคนที่ชอบ", "Manga"], ascending=[True, True])
+    st.bar_chart(asc.set_index("Manga")["จำนวนคนที่ชอบ"], horizontal=True,
+                 use_container_width=True, color="#f59e0b")
+    st.caption(f"เรื่องที่ถูกเลือกน้อยที่สุดอยู่บนสุดของกราฟ (มี {min_likes} คนชอบ"
+               f"{' — ยังไม่มีใครเลือกเลย' if min_likes == 0 else ''})")
+    st.markdown("### 🏅 ตารางอันดับความนิยม")
+    table = df[["Manga", "จำนวนคนที่ชอบ", "คะแนนความนิยม"]].copy()
+    table.insert(0, "อันดับ", range(1, len(table) + 1))
+    st.dataframe(table, use_container_width=True, hide_index=True,
+                 column_config={"คะแนนความนิยม": st.column_config.ProgressColumn(
+                     "คะแนนความนิยม", min_value=0, max_value=100, format="%d")})
+    st.markdown("### 🧊 Manga ที่คนเลือกน้อยที่สุด")
+    for r in pop:
+        if r["likes"] == min_likes:
+            display_manga_card(r["manga_id"], r["title"], r.get("image_url"))
+
+# =========================================================
+# FRIENDS
+# =========================================================
+elif page == "Friends":
+    st.subheader("🤝 ความสัมพันธ์ระหว่าง User (เพื่อน)")
+    users = get_users()
+    if len(users) < 2:
+        st.warning("ต้องมี User อย่างน้อย 2 คนจึงจะเชื่อมเป็นเพื่อนได้"); st.stop()
+    uopts = {f"{u['name']} ({u['user_id']})": u["user_id"] for u in users}
+    st.markdown("### ➕ เพิ่มความสัมพันธ์")
+    c1, c2, c3 = st.columns([3, 3, 2])
+    a_label = c1.selectbox("User คนที่ 1", list(uopts.keys()), key="fr_a")
+    b_label = c2.selectbox("เป็นเพื่อนกับ", list(uopts.keys()), index=1, key="fr_b")
+    a_id, b_id = uopts[a_label], uopts[b_label]
+    c3.write(""); c3.write("")
+    if c3.button("🤝 เชื่อมเป็นเพื่อน", type="primary", use_container_width=True):
+        if a_id == b_id:
+            st.error("เลือก User คนเดียวกันไม่ได้")
+        elif any(f["user_id"] == b_id for f in get_friends(a_id)):
+            st.info("สองคนนี้เป็นเพื่อนกันอยู่แล้ว")
+        else:
+            add_friend(a_id, b_id)
+            st.success(f"เชื่อม {a_label} กับ {b_label} เป็นเพื่อนแล้ว")
+            st.rerun()
+    st.divider()
+    st.markdown("### 👥 เพื่อนของแต่ละคน")
+    who = uopts[st.selectbox("ดูเพื่อนของ", list(uopts.keys()), key="fr_who")]
+    friends = get_friends(who)
+    if not friends:
+        st.info("User นี้ยังไม่มีเพื่อน")
+    for f in friends:
+        d1, d2 = st.columns([5, 1])
+        d1.markdown(f"🤝 **{f['name']}** ({f['user_id']})")
+        if d2.button("❌ ลบ", key=f"delfr_{who}_{f['user_id']}"):
+            delete_friend(who, f["user_id"])
+            st.rerun()
+    st.divider()
+    st.markdown("### 🕸️ กราฟความสัมพันธ์เพื่อน")
+    _fr = get_all_friendships()
+    if _fr:
+        dot = ["graph G {", 'layout=neato; overlap=false; splines=true; bgcolor="transparent";',
+               'node [shape=ellipse, style=filled, fillcolor="#3b82f6", color="#1d4ed8", fontcolor=white, '
+               'fontname="Noto Sans Thai, Tahoma, Arial"];', 'edge [color="#10b981", penwidth=2.4];']
+        names = {}
+        for r in _fr:
+            names[r["a_id"]] = r["a_name"]; names[r["b_id"]] = r["b_name"]
+            dot.append(f'"{r["a_id"]}" -- "{r["b_id"]}";')
+        for uid, nm in names.items():
+            dot.append(f'"{uid}" [label="👤 {str(nm).replace(chr(34), chr(39))}"];')
+        dot.append("}")
+        st.graphviz_chart("\n".join(dot), use_container_width=True)
+        st.dataframe(pd.DataFrame([{"User 1": r["a_name"], "User 2": r["b_name"]} for r in _fr]),
+                     use_container_width=True, hide_index=True)
+    else:
+        st.info("ยังไม่มีความสัมพันธ์เพื่อน เพิ่มได้ที่ด้านบน")
+    st.caption("ดูเส้นเพื่อนรวมกับ LIKES ได้ที่กราฟใน Dashboard โดยเลือกชนิดเส้นเชื่อม FRIEND_OF")
+
+# =========================================================
 # MANAGE LIKES
 # =========================================================
 elif page == "Manage Likes":
@@ -549,26 +823,7 @@ elif page == "Manage Likes":
 # =========================================================
 elif page == "Graph Explorer":
     st.subheader("🕸️ Graph Explorer")
-    user_id = user_picker(include_all=True)
-    rows = get_graph(user_id)
-    if not rows:
-        st.info("ยังไม่มี Graph")
-    else:
-        dot = ["digraph G {", 'rankdir="LR";',
-               'node [shape=box, style="rounded,filled", fillcolor="#f8fafc"];']
-        seen = set()
-        for r in rows:
-            for key, name_key, kind in (("source_id", "source_name", "User"),
-                                        ("target_id", "target_name", "Manga")):
-                if r[key] not in seen:
-                    label = str(r[name_key]).replace('"', "'")
-                    dot.append(f'"{r[key]}" [label="{label}\\n{kind}"];')
-                    seen.add(r[key])
-            dot.append(f'"{r["source_id"]}" -> "{r["target_id"]}" [label="{r["relationship"]}"];')
-        dot.append("}")
-        st.graphviz_chart("\n".join(dot), use_container_width=True)
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    st.code("MATCH p=(u:User)-[r:LIKES|RECOMMENDS]->(m:Manga)\nRETURN p\nLIMIT 100", language="cypher")
+    render_relationship_graph("gx_page")
 
 # =========================================================
 # ADMIN PANEL
